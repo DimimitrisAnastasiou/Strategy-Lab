@@ -1,15 +1,10 @@
 """
-Strategy Lab - Premium UI v7
+Strategy Lab - Premium UI v7.1
 ================================
-Changes from v6:
-- Optimize tab updated for optimize module v8:
-  - `best_results` → `full_data_results` throughout
-  - Window type selector (rolling / anchored) when WFO enabled
-  - Train window bars slider when rolling mode selected
-  - Robustness warnings displayed as expandable alert
-  - Efficiency ratio surfaced as dedicated metric
-  - Stitched OOS equity chart for WFO (authoritative performance view)
-  - Trial budget recommendations displayed inline
+Changes from v7:
+- HPDR Bands overlay on price chart (sidebar + chart)  [visual only]
+- RSI Hidden Divergence sub-panel                       [visual only]
+- Y-axis locked to price range when HPDR bands are active
 """
 
 import streamlit as st
@@ -26,6 +21,9 @@ from src.backtest import BacktestEngine, BacktestResults
 from src.optimize import optimize_strategy
 from src.montecarlo import run_monte_carlo, MonteCarloResult
 from src.analytics import analyze_calendar, analyze_trade_calendar
+from src.indicators import (
+    rsi_hidden_divergence, hpdr_bands, rsi as compute_rsi,
+)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PAGE CONFIG
@@ -111,14 +109,26 @@ def get_default_params() -> Dict[str, Any]:
         'time_exit_enabled': False, 'time_exit_bars': 20,
         'ma_exit_enabled': False, 'ma_exit_fast': 10, 'ma_exit_slow': 20,
         'bbwp_exit_enabled': False, 'bbwp_exit_threshold': 80,
+        # ── Visual indicators (display-only, not strategy filters) ────────────
+        'hpdr_enabled': False,
+        'hpdr_lookback': 252,
+        'rsi_div_enabled': False,
+        'rsi_div_length': 14,
+        'rsi_div_pivot_left': 5,
+        'rsi_div_pivot_right': 5,
     }
 
 for key, default in [('params', get_default_params()), ('df', None), ('multi_df', {}),
                       ('backtest_results', None), ('optimization_results', None),
                       ('capital', 10000), ('commission', 1.0),
-                      ('pinned_params', set())]:   # v9: set of pinned param names
+                      ('pinned_params', set())]:
     if key not in st.session_state:
         st.session_state[key] = default
+
+# Forward-fill any new keys missing from older session state
+for k, v in get_default_params().items():
+    if k not in st.session_state.params:
+        st.session_state.params[k] = v
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -246,24 +256,186 @@ def _chart_layout(height=280, **kwargs):
     defaults.update(kwargs)
     return defaults
 
-def create_price_chart_with_trades(df, trades=None):
+
+def create_price_chart_with_trades(df, trades=None, bands=None):
+    """
+    Price chart with optional trade markers and HPDR rainbow cone overlay.
+
+    Y-axis is always locked to the actual price range so HPDR band traces
+    (which extend well beyond price on trending instruments) never push
+    the axis into unusable territory.
+    """
     fig = go.Figure()
-    fig.add_trace(go.Candlestick(x=df.index, open=df['open'], high=df['high'], low=df['low'], close=df['close'],
+
+    # ── HPDR rainbow cone — drawn BEFORE candles so it sits behind ────────────
+    if bands is not None:
+        idx = df.index
+
+        ZONES = [
+            ('2.0', '2.5', 'rgba(180,30,30,0.18)'),
+            ('1.5', '2.0', 'rgba(220,110,30,0.18)'),
+            ('1.0', '1.5', 'rgba(200,185,0,0.18)'),
+            ('0.5', '1.0', 'rgba(60,190,80,0.18)'),
+            ('0.0', '0.5', 'rgba(0,195,180,0.20)'),
+        ]
+
+        def _get(key):
+            s = bands.get(key)
+            return s.reindex(idx) if s is not None else None
+
+        center = _get('center')
+        upper = {z: _get(f'upper_{z}') for z in ['0.5','1.0','1.5','2.0','2.5']}
+        lower = {z: _get(f'lower_{z}') for z in ['0.5','1.0','1.5','2.0','2.5']}
+
+        for inner_z, outer_z, fill_rgba in ZONES:
+            u_inner = upper.get(inner_z) if inner_z != '0.0' else center
+            u_outer = upper.get(outer_z)
+            if u_inner is None or u_outer is None:
+                continue
+            fig.add_trace(go.Scatter(x=idx, y=u_outer, mode='lines',
+                line=dict(width=0.5, color=fill_rgba.replace('0.18','0.4').replace('0.20','0.4')),
+                showlegend=False, hoverinfo='skip'))
+            fig.add_trace(go.Scatter(x=idx, y=u_inner, mode='lines',
+                line=dict(width=0), fill='tonexty', fillcolor=fill_rgba,
+                showlegend=False, hoverinfo='skip'))
+
+        for inner_z, outer_z, fill_rgba in ZONES:
+            l_inner = lower.get(inner_z) if inner_z != '0.0' else center
+            l_outer = lower.get(outer_z)
+            if l_inner is None or l_outer is None:
+                continue
+            fig.add_trace(go.Scatter(x=idx, y=l_inner, mode='lines',
+                line=dict(width=0), showlegend=False, hoverinfo='skip'))
+            fig.add_trace(go.Scatter(x=idx, y=l_outer, mode='lines',
+                line=dict(width=0.5, color=fill_rgba.replace('0.18','0.4').replace('0.20','0.4')),
+                fill='tonexty', fillcolor=fill_rgba, showlegend=False, hoverinfo='skip'))
+
+        if center is not None:
+            fig.add_trace(go.Scatter(x=idx, y=center, mode='lines',
+                line=dict(color='rgba(255,255,255,0.35)', width=1, dash='dot'),
+                name='HPDR Center', showlegend=True, hoverinfo='skip'))
+
+        for z, color in [('0.5','rgba(0,195,180,0.6)'), ('1.0','rgba(60,190,80,0.5)'),
+                          ('1.5','rgba(200,185,0,0.5)'), ('2.0','rgba(220,110,30,0.5)'),
+                          ('2.5','rgba(180,30,30,0.5)')]:
+            pct = {'0.5':'38%','1.0':'68%','1.5':'87%','2.0':'95%','2.5':'99%'}[z]
+            for side, arr in [('upper', upper), ('lower', lower)]:
+                s = arr.get(z)
+                if s is not None:
+                    fig.add_trace(go.Scatter(x=idx, y=s, mode='lines',
+                        line=dict(color=color, width=0.8),
+                        name=f'HPDR ±{z}σ ({pct})' if side == 'upper' else None,
+                        showlegend=(side == 'upper'),
+                        hovertemplate=f'±{z}σ: %{{y:.2f}}<extra></extra>'))
+
+    # ── Candlesticks ──────────────────────────────────────────────────────────
+    fig.add_trace(go.Candlestick(
+        x=df.index, open=df['open'], high=df['high'], low=df['low'], close=df['close'],
         increasing_line_color='#10b981', decreasing_line_color='#ef4444',
-        increasing_fillcolor='rgba(16,185,129,0.3)', decreasing_fillcolor='rgba(239,68,68,0.3)', name='Price'))
+        increasing_fillcolor='rgba(16,185,129,0.3)', decreasing_fillcolor='rgba(239,68,68,0.3)',
+        name='Price'))
+
+    # ── Trade markers ─────────────────────────────────────────────────────────
     if trades:
         ed = [t.entry_date for t in trades]; ep = [t.entry_price for t in trades]
         ec = ['#10b981' if t.direction=='long' else '#ef4444' for t in trades]
         es = ['triangle-up' if t.direction=='long' else 'triangle-down' for t in trades]
         el = [f"{'▲ Long' if t.direction=='long' else '▼ Short'} @ ${t.entry_price:.2f}" for t in trades]
-        fig.add_trace(go.Scatter(x=ed, y=ep, mode='markers', marker=dict(color=ec, size=9, symbol=es, line=dict(width=1, color='white')), text=el, hoverinfo='text', name='Entries'))
-        xt = [t for t in trades if t.exit_date]; xd = [t.exit_date for t in xt]; xp = [t.exit_price for t in xt]
-        xc = ['#10b981' if t.pnl>=0 else '#ef4444' for t in xt]
+        fig.add_trace(go.Scatter(x=ed, y=ep, mode='markers',
+            marker=dict(color=ec, size=9, symbol=es, line=dict(width=1, color='white')),
+            text=el, hoverinfo='text', name='Entries'))
+        xt = [t for t in trades if t.exit_date]
+        xd = [t.exit_date for t in xt]; xp = [t.exit_price for t in xt]
+        xc = ['#10b981' if t.pnl >= 0 else '#ef4444' for t in xt]
         xl = [f"Exit @ ${t.exit_price:.2f} | ${t.pnl:+.2f} ({t.exit_reason})" for t in xt]
-        fig.add_trace(go.Scatter(x=xd, y=xp, mode='markers', marker=dict(color=xc, size=8, symbol='x', line=dict(width=1, color='white')), text=xl, hoverinfo='text', name='Exits'))
-    fig.update_layout(**_chart_layout(320), xaxis_rangeslider_visible=False)
-    fig.update_xaxes(gridcolor='rgba(45,53,72,0.3)'); fig.update_yaxes(gridcolor='rgba(45,53,72,0.3)')
+        fig.add_trace(go.Scatter(x=xd, y=xp, mode='markers',
+            marker=dict(color=xc, size=8, symbol='x', line=dict(width=1, color='white')),
+            text=xl, hoverinfo='text', name='Exits'))
+
+    # ── Y-axis locked to price range — HPDR bands must not expand this ────────
+    price_min = float(df['low'].min())
+    price_max = float(df['high'].max())
+    pad = (price_max - price_min) * 0.05
+    y_range = [price_min - pad, price_max + pad]
+
+    show_legend = bands is not None
+    fig.update_layout(
+        **_chart_layout(320, showlegend=show_legend,
+                        legend=dict(orientation='h', y=1.06, font=dict(size=8), traceorder='normal')),
+        xaxis_rangeslider_visible=False)
+    fig.update_xaxes(gridcolor='rgba(45,53,72,0.3)')
+    fig.update_yaxes(gridcolor='rgba(45,53,72,0.3)', range=y_range)
     return fig
+
+
+def create_rsi_divergence_chart(df: pd.DataFrame, p: Dict) -> go.Figure:
+    """
+    Two-panel chart:
+      Row 1 (65%) — price candlesticks with bull/bear divergence arrows
+      Row 2 (35%) — RSI line with OB/OS bands and divergence dots
+
+    Signals are placed at the *confirmation* bar (pivot_right bars after the
+    actual swing), not retroactively — zero look-ahead bias.
+    """
+    length    = p.get('rsi_div_length', 14)
+    piv_left  = p.get('rsi_div_pivot_left', 5)
+    piv_right = p.get('rsi_div_pivot_right', 5)
+
+    rsi_series = compute_rsi(df['close'], length)
+    bull, bear = rsi_hidden_divergence(df['close'], rsi_length=length,
+                                       pivot_left=piv_left, pivot_right=piv_right)
+
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        vertical_spacing=0.06, row_heights=[0.65, 0.35])
+
+    fig.add_trace(go.Candlestick(
+        x=df.index, open=df['open'], high=df['high'], low=df['low'], close=df['close'],
+        increasing_line_color='#10b981', decreasing_line_color='#ef4444',
+        increasing_fillcolor='rgba(16,185,129,0.3)', decreasing_fillcolor='rgba(239,68,68,0.3)',
+        name='Price', showlegend=False), row=1, col=1)
+
+    bull_idx = df.index[bull]
+    if len(bull_idx) > 0:
+        fig.add_trace(go.Scatter(x=bull_idx, y=df['low'][bull] * 0.998,
+            mode='markers+text',
+            marker=dict(symbol='triangle-up', color='#10b981', size=11, line=dict(width=1, color='white')),
+            text=['HB'] * len(bull_idx), textposition='bottom center',
+            textfont=dict(size=7, color='#10b981'), name='Hidden Bull', showlegend=True,
+            hovertemplate='Hidden Bullish Div<br>%{x}<extra></extra>'), row=1, col=1)
+
+    bear_idx = df.index[bear]
+    if len(bear_idx) > 0:
+        fig.add_trace(go.Scatter(x=bear_idx, y=df['high'][bear] * 1.002,
+            mode='markers+text',
+            marker=dict(symbol='triangle-down', color='#ef4444', size=11, line=dict(width=1, color='white')),
+            text=['HBr'] * len(bear_idx), textposition='top center',
+            textfont=dict(size=7, color='#ef4444'), name='Hidden Bear', showlegend=True,
+            hovertemplate='Hidden Bearish Div<br>%{x}<extra></extra>'), row=1, col=1)
+
+    fig.add_trace(go.Scatter(x=df.index, y=rsi_series, mode='lines',
+        line=dict(color='#f59e0b', width=1.5), name='RSI', showlegend=False), row=2, col=1)
+
+    for level, color in [(70,'rgba(239,68,68,0.4)'), (30,'rgba(16,185,129,0.4)'), (50,'rgba(100,116,139,0.3)')]:
+        fig.add_hline(y=level, line_dash='dot', line_color=color, line_width=1, row=2, col=1)
+
+    if len(bull_idx) > 0:
+        fig.add_trace(go.Scatter(x=bull_idx, y=rsi_series[bull], mode='markers',
+            marker=dict(color='#10b981', size=8, symbol='circle', line=dict(width=1, color='white')),
+            showlegend=False, hovertemplate='Hidden Bull<br>RSI: %{y:.1f}<br>%{x}<extra></extra>'), row=2, col=1)
+
+    if len(bear_idx) > 0:
+        fig.add_trace(go.Scatter(x=bear_idx, y=rsi_series[bear], mode='markers',
+            marker=dict(color='#ef4444', size=8, symbol='circle', line=dict(width=1, color='white')),
+            showlegend=False, hovertemplate='Hidden Bear<br>RSI: %{y:.1f}<br>%{x}<extra></extra>'), row=2, col=1)
+
+    fig.update_layout(**_chart_layout(400, showlegend=True,
+        legend=dict(orientation='h', y=1.06, font=dict(size=8))),
+        xaxis_rangeslider_visible=False)
+    fig.update_xaxes(gridcolor='rgba(45,53,72,0.3)')
+    fig.update_yaxes(gridcolor='rgba(45,53,72,0.3)')
+    fig.update_yaxes(title_text='RSI', range=[0, 100], row=2, col=1)
+    return fig
+
 
 def create_equity_chart(results):
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08, row_heights=[0.7, 0.3])
@@ -280,11 +452,6 @@ def create_equity_chart(results):
     return fig
 
 def create_stitched_equity_chart(equity: pd.Series):
-    """
-    Render the stitched OOS equity curve from WFO.
-    This is the authoritative unbiased performance view — each segment
-    is a genuine out-of-sample period with no IS contamination.
-    """
     if equity is None or len(equity) == 0:
         return go.Figure()
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08, row_heights=[0.7, 0.3])
@@ -296,8 +463,7 @@ def create_stitched_equity_chart(equity: pd.Series):
     fig.add_trace(go.Scatter(x=dd.index, y=dd.values, mode='lines',
         line=dict(color='#ef4444', width=2), fill='tozeroy',
         fillcolor='rgba(239,68,68,0.15)', name='Drawdown'), row=2, col=1)
-    fig.update_layout(**_chart_layout(280, showlegend=True,
-        legend=dict(orientation='h', y=1.12, font=dict(size=8))))
+    fig.update_layout(**_chart_layout(280, showlegend=True, legend=dict(orientation='h', y=1.12, font=dict(size=8))))
     fig.update_xaxes(gridcolor='rgba(45,53,72,0.3)')
     fig.update_yaxes(gridcolor='rgba(45,53,72,0.3)')
     return fig
@@ -375,129 +541,58 @@ def create_mc_histogram(values, title='', xaxis_title=''):
     return fig
 
 def create_dow_chart(dow_df: pd.DataFrame):
-    """Bar chart: avg return by day of week, coloured by sign, with win rate overlay."""
-    if dow_df.empty:
-        return go.Figure()
-
+    if dow_df.empty: return go.Figure()
     colors = ['#ef4444' if v < 0 else '#10b981' for v in dow_df['Avg %']]
     win_rates = [float(w.replace('%', '')) for w in dow_df['Win Rate']]
-
-    fig = make_subplots(
-        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
-        row_heights=[0.65, 0.35],
-        subplot_titles=['Average Daily Return %', 'Win Rate %'],
-    )
-
-    fig.add_trace(go.Bar(
-        x=dow_df['Day'], y=dow_df['Avg %'],
-        marker_color=colors,
-        text=[f"{v:+.4f}%" for v in dow_df['Avg %']],
-        textposition='outside',
-        name='Avg Return',
-    ), row=1, col=1)
-
-    fig.add_trace(go.Bar(
-        x=dow_df['Day'], y=win_rates,
-        marker_color='#3b82f6', opacity=0.7,
-        text=[f"{w:.1f}%" for w in win_rates],
-        textposition='outside',
-        name='Win Rate',
-    ), row=2, col=1)
-
-    fig.add_hline(y=50, line_dash='dot', line_color='#64748b', row=2, col=1)
-
-    fig.update_layout(
-        **_chart_layout(380, showlegend=False),
-        bargap=0.3,
-    )
-    fig.update_xaxes(type='category', fixedrange=True)
-    fig.update_yaxes(fixedrange=True)
-    return fig
-
-
-def create_monthly_bar_chart(monthly_df: pd.DataFrame):
-    """Bar chart: avg return by calendar month with win rate overlay."""
-    if monthly_df.empty:
-        return go.Figure()
-
-    colors = ['#ef4444' if v < 0 else '#10b981' for v in monthly_df['Avg %']]
-    win_rates = [float(w.replace('%', '')) for w in monthly_df['Win Rate']]
-
-    fig = make_subplots(
-        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
-        row_heights=[0.65, 0.35],
-        subplot_titles=['Average Monthly Return %', 'Win Rate %'],
-    )
-    fig.add_trace(go.Bar(
-        x=monthly_df['Month'], y=monthly_df['Avg %'],
-        marker_color=colors,
-        text=[f"{v:+.2f}%" for v in monthly_df['Avg %']],
-        textposition='outside', name='Avg Return',
-    ), row=1, col=1)
-    fig.add_trace(go.Bar(
-        x=monthly_df['Month'], y=win_rates,
-        marker_color='#3b82f6', opacity=0.7,
-        text=[f"{w:.1f}%" for w in win_rates],
-        textposition='outside', name='Win Rate',
-    ), row=2, col=1)
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
+        row_heights=[0.65, 0.35], subplot_titles=['Average Daily Return %', 'Win Rate %'])
+    fig.add_trace(go.Bar(x=dow_df['Day'], y=dow_df['Avg %'], marker_color=colors,
+        text=[f"{v:+.4f}%" for v in dow_df['Avg %']], textposition='outside', name='Avg Return'), row=1, col=1)
+    fig.add_trace(go.Bar(x=dow_df['Day'], y=win_rates, marker_color='#3b82f6', opacity=0.7,
+        text=[f"{w:.1f}%" for w in win_rates], textposition='outside', name='Win Rate'), row=2, col=1)
     fig.add_hline(y=50, line_dash='dot', line_color='#64748b', row=2, col=1)
     fig.update_layout(**_chart_layout(380, showlegend=False), bargap=0.3)
     fig.update_xaxes(type='category', fixedrange=True)
     fig.update_yaxes(fixedrange=True)
     return fig
 
-
-def create_monthly_heatmap(heatmap_df: pd.DataFrame):
-    """Year × Month heatmap with value annotations."""
-    if heatmap_df.empty:
-        return go.Figure()
-
-    z = heatmap_df.values
-    # Replace NaN with None so Plotly renders them as blank cells
-    z_display = np.where(np.isnan(z.astype(float)), None, z)
-
-    text = np.where(
-        np.isnan(z.astype(float)),
-        '',
-        [[f"{v:.1f}%" if v is not None else '' for v in row] for row in z]
-    )
-
-    fig = go.Figure(data=go.Heatmap(
-        z=z_display,
-        x=heatmap_df.columns.tolist(),
-        y=[str(y) for y in heatmap_df.index],
-        colorscale='RdYlGn',
-        zmid=0,
-        text=text,
-        texttemplate='%{text}',
-        showscale=True,
-        colorbar=dict(title='Return %', thickness=12),
-    ))
-    height = max(250, len(heatmap_df) * 38 + 60)
-    fig.update_layout(**_chart_layout(height))
+def create_monthly_bar_chart(monthly_df: pd.DataFrame):
+    if monthly_df.empty: return go.Figure()
+    colors = ['#ef4444' if v < 0 else '#10b981' for v in monthly_df['Avg %']]
+    win_rates = [float(w.replace('%', '')) for w in monthly_df['Win Rate']]
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
+        row_heights=[0.65, 0.35], subplot_titles=['Average Monthly Return %', 'Win Rate %'])
+    fig.add_trace(go.Bar(x=monthly_df['Month'], y=monthly_df['Avg %'], marker_color=colors,
+        text=[f"{v:+.2f}%" for v in monthly_df['Avg %']], textposition='outside', name='Avg Return'), row=1, col=1)
+    fig.add_trace(go.Bar(x=monthly_df['Month'], y=win_rates, marker_color='#3b82f6', opacity=0.7,
+        text=[f"{w:.1f}%" for w in win_rates], textposition='outside', name='Win Rate'), row=2, col=1)
+    fig.add_hline(y=50, line_dash='dot', line_color='#64748b', row=2, col=1)
+    fig.update_layout(**_chart_layout(380, showlegend=False), bargap=0.3)
+    fig.update_xaxes(type='category', fixedrange=True); fig.update_yaxes(fixedrange=True)
     return fig
 
+def create_monthly_heatmap(heatmap_df: pd.DataFrame):
+    if heatmap_df.empty: return go.Figure()
+    z = heatmap_df.values
+    z_display = np.where(np.isnan(z.astype(float)), None, z)
+    text = np.where(np.isnan(z.astype(float)), '',
+        [[f"{v:.1f}%" if v is not None else '' for v in row] for row in z])
+    fig = go.Figure(data=go.Heatmap(z=z_display, x=heatmap_df.columns.tolist(),
+        y=[str(y) for y in heatmap_df.index], colorscale='RdYlGn', zmid=0,
+        text=text, texttemplate='%{text}', showscale=True,
+        colorbar=dict(title='Return %', thickness=12)))
+    fig.update_layout(**_chart_layout(max(250, len(heatmap_df) * 38 + 60)))
+    return fig
 
 def create_dom_chart(dom_df: pd.DataFrame):
-    """Day-of-month bar chart with avg return and win rate line overlay."""
-    if dom_df.empty:
-        return go.Figure()
-
+    if dom_df.empty: return go.Figure()
     colors = ['#ef4444' if v < 0 else '#10b981' for v in dom_df['Avg %']]
     win_rates = [float(w.replace('%', '')) for w in dom_df['Win Rate']]
-
     fig = make_subplots(specs=[[{"secondary_y": True}]])
-    fig.add_trace(go.Bar(
-        x=dom_df['Day of Month'], y=dom_df['Avg %'],
-        marker_color=colors, name='Avg Return %', opacity=0.85,
-    ), secondary_y=False)
-    fig.add_trace(go.Scatter(
-        x=dom_df['Day of Month'], y=win_rates,
-        mode='lines+markers',
-        line=dict(color='#f59e0b', width=2),
-        marker=dict(size=5),
-        name='Win Rate %',
-    ), secondary_y=True)
+    fig.add_trace(go.Bar(x=dom_df['Day of Month'], y=dom_df['Avg %'],
+        marker_color=colors, name='Avg Return %', opacity=0.85), secondary_y=False)
+    fig.add_trace(go.Scatter(x=dom_df['Day of Month'], y=win_rates, mode='lines+markers',
+        line=dict(color='#f59e0b', width=2), marker=dict(size=5), name='Win Rate %'), secondary_y=True)
     fig.add_hline(y=0, line_dash='dot', line_color='#64748b', secondary_y=False)
     fig.update_layout(**_chart_layout(280, showlegend=True, legend=dict(orientation='h', y=1.1)))
     fig.update_xaxes(title_text='Day of Month', dtick=1, fixedrange=True)
@@ -505,49 +600,31 @@ def create_dom_chart(dom_df: pd.DataFrame):
     fig.update_yaxes(title_text='Win Rate %', fixedrange=True, secondary_y=True)
     return fig
 
-
 def create_hourly_chart(hourly_df: pd.DataFrame):
-    """Hourly avg return bar chart (intraday data only)."""
-    if hourly_df is None or hourly_df.empty:
-        return go.Figure()
-
+    if hourly_df is None or hourly_df.empty: return go.Figure()
     colors = ['#ef4444' if v < 0 else '#10b981' for v in hourly_df['Avg %']]
     fig = go.Figure()
-    fig.add_trace(go.Bar(
-        x=hourly_df['Hour'], y=hourly_df['Avg %'],
-        marker_color=colors,
-        text=[f"{v:+.4f}%" for v in hourly_df['Avg %']],
-        textposition='outside',
-    ))
+    fig.add_trace(go.Bar(x=hourly_df['Hour'], y=hourly_df['Avg %'], marker_color=colors,
+        text=[f"{v:+.4f}%" for v in hourly_df['Avg %']], textposition='outside'))
     fig.add_hline(y=0, line_dash='dot', line_color='#64748b')
     fig.update_layout(**_chart_layout(260), bargap=0.2)
-    fig.update_xaxes(type='category', fixedrange=True)
-    fig.update_yaxes(fixedrange=True)
+    fig.update_xaxes(type='category', fixedrange=True); fig.update_yaxes(fixedrange=True)
     return fig
 
-
 def create_return_distribution_chart(dist):
-    """Histogram of daily returns with mean/±1σ lines."""
-    if not dist.bins:
-        return go.Figure()
-
+    if not dist.bins: return go.Figure()
     colors = ['#ef4444' if b < 0 else '#10b981' for b in dist.bins]
     fig = go.Figure()
-    fig.add_trace(go.Bar(
-        x=dist.bins, y=dist.counts,
-        marker_color=colors, opacity=0.75, name='Frequency',
-    ))
+    fig.add_trace(go.Bar(x=dist.bins, y=dist.counts, marker_color=colors, opacity=0.75, name='Frequency'))
     for val, label, color in [
         (dist.mean, f'Mean {dist.mean:+.3f}%', '#f59e0b'),
-        (dist.mean - dist.std, f'−1σ {dist.mean - dist.std:.3f}%', '#94a3b8'),
-        (dist.mean + dist.std, f'+1σ {dist.mean + dist.std:.3f}%', '#94a3b8'),
+        (dist.mean-dist.std, f'−1σ {dist.mean-dist.std:.3f}%', '#94a3b8'),
+        (dist.mean+dist.std, f'+1σ {dist.mean+dist.std:.3f}%', '#94a3b8'),
     ]:
         fig.add_vline(x=val, line_dash='dash', line_color=color,
                       annotation_text=label, annotation_position='top')
-    fig.update_layout(
-        **_chart_layout(280, showlegend=False),
-        xaxis_title='Daily Return %', yaxis_title='Frequency',
-    )
+    fig.update_layout(**_chart_layout(280, showlegend=False),
+                      xaxis_title='Daily Return %', yaxis_title='Frequency')
     return fig
 
 
@@ -562,7 +639,6 @@ with st.sidebar:
     st.markdown("### 📈 Data")
     data_src = st.radio("Source", ["Yahoo Finance", "Sample", "CSV"], horizontal=True, label_visibility="collapsed")
 
-    # yfinance API hard limits per interval (calendar days)
     _INTERVAL_MAX_DAYS = {
         '1m': 7, '2m': 60, '5m': 60, '15m': 60, '30m': 60,
         '60m': 730, '90m': 60, '1h': 730,
@@ -578,14 +654,8 @@ with st.sidebar:
         interval = c1.selectbox("Interval", INTERVALS, index=INTERVALS.index("1d"))
         max_days = _INTERVAL_MAX_DAYS.get(interval)
         if max_days:
-            # Intraday: cap the slider and show the API limit clearly
-            days = c2.slider(
-                "Days",
-                min_value=1,
-                max_value=max_days,
-                value=min(max_days, 60),
-                help=f"Yahoo Finance only provides the last **{max_days} calendar days** for `{interval}` data."
-            )
+            days = c2.slider("Days", min_value=1, max_value=max_days, value=min(max_days, 60),
+                help=f"Yahoo Finance only provides the last **{max_days} calendar days** for `{interval}` data.")
             st.caption(f"⚠️ `{interval}` data limited to last **{max_days} days** by Yahoo Finance API.")
         else:
             days = c2.number_input("Days", 30, 7300, 730)
@@ -597,12 +667,8 @@ with st.sidebar:
                                help="Daily return std dev. 0.015 ≈ typical equity.")
 
     else:  # CSV
-        uploaded_file = st.file_uploader(
-            "Upload CSV",
-            type=["csv"],
-            help="Expected columns: date, open, high, low, close[, volume]. "
-                 "Date column must be parseable as datetime."
-        )
+        uploaded_file = st.file_uploader("Upload CSV", type=["csv"],
+            help="Expected columns: date, open, high, low, close[, volume]. Date must be parseable as datetime.")
 
     if st.button("📥 Load", use_container_width=True):
         with st.spinner("Loading..."):
@@ -610,38 +676,20 @@ with st.sidebar:
                 if data_src == "Yahoo Finance":
                     end_dt = datetime.now()
                     start_dt = end_dt - timedelta(days=days)
-                    df = fetch_yfinance(
-                        symbol,
-                        str(start_dt.date()),
-                        str(end_dt.date()),
-                        interval,
-                    )
+                    df = fetch_yfinance(symbol, str(start_dt.date()), str(end_dt.date()), interval)
                     st.session_state.df = df
-
-                    # Surface clamping warning if date range was adjusted
                     if df.attrs.get('date_range_clamped'):
                         st.warning(
                             f"⚠️ Date range clamped: `{interval}` data is limited to "
                             f"the last **{df.attrs['max_interval_days']} calendar days**. "
-                            f"Loaded: **{df.attrs['actual_start']}** → **{df.attrs['actual_end']}**."
-                        )
+                            f"Loaded: **{df.attrs['actual_start']}** → **{df.attrs['actual_end']}**.")
                     else:
-                        st.success(
-                            f"✅ **{len(df):,} bars** · "
-                            f"{df.attrs['actual_start']} → {df.attrs['actual_end']}"
-                        )
+                        st.success(f"✅ **{len(df):,} bars** · {df.attrs['actual_start']} → {df.attrs['actual_end']}")
 
                 elif data_src == "Sample":
-                    df = generate_sample_data(
-                        days=int(days),
-                        volatility=sample_vol,
-                        seed=42,
-                    )
+                    df = generate_sample_data(days=int(days), volatility=sample_vol, seed=42)
                     st.session_state.df = df
-                    st.success(
-                        f"✅ **{len(df):,} bars** synthetic · "
-                        f"{df.attrs['actual_start']} → {df.attrs['actual_end']}"
-                    )
+                    st.success(f"✅ **{len(df):,} bars** synthetic · {df.attrs['actual_start']} → {df.attrs['actual_end']}")
 
                 else:  # CSV
                     if uploaded_file is None:
@@ -654,10 +702,7 @@ with st.sidebar:
                         try:
                             df = load_csv(tmp_path)
                             st.session_state.df = df
-                            st.success(
-                                f"✅ **{len(df):,} bars** from CSV · "
-                                f"{str(df.index[0].date())} → {str(df.index[-1].date())}"
-                            )
+                            st.success(f"✅ **{len(df):,} bars** from CSV · {str(df.index[0].date())} → {str(df.index[-1].date())}")
                         finally:
                             os.unlink(tmp_path)
 
@@ -665,9 +710,11 @@ with st.sidebar:
                 st.error(str(e))
             except Exception as e:
                 st.error(f"Unexpected error: {str(e)}")
+
     st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
     st.markdown("### ⚙️ Strategy")
-    p['trade_direction'] = st.selectbox("Direction", ["Long Only","Short Only","Both"], index=["Long Only","Short Only","Both"].index(p['trade_direction']))
+    p['trade_direction'] = st.selectbox("Direction", ["Long Only","Short Only","Both"],
+        index=["Long Only","Short Only","Both"].index(p['trade_direction']))
     with st.expander("💰 Position Sizing", expanded=False):
         p['position_size_pct'] = st.slider("Position %", 10, 100, int(p['position_size_pct']), 10)
         p['use_kelly'] = st.toggle("Kelly Criterion", p['use_kelly'])
@@ -688,7 +735,8 @@ with st.sidebar:
             p['bbwp_sma_length'] = st.slider("SMA", 2, 15, p['bbwp_sma_length'], key="bsma")
             p['bbwp_threshold_long'] = st.slider("Thresh Long", 20, 80, p['bbwp_threshold_long'], key="btl")
             p['bbwp_threshold_short'] = st.slider("Thresh Short", 20, 80, p['bbwp_threshold_short'], key="bts")
-            p['bbwp_ma_filter'] = st.selectbox("MA Filter", ["disabled","decreasing","increasing"], index=["disabled","decreasing","increasing"].index(p['bbwp_ma_filter']), key="bmf")
+            p['bbwp_ma_filter'] = st.selectbox("MA Filter", ["disabled","decreasing","increasing"],
+                index=["disabled","decreasing","increasing"].index(p['bbwp_ma_filter']), key="bmf")
     with st.expander("📈 ADX", expanded=False):
         p['adx_enabled'] = st.toggle("Enable", p['adx_enabled'], key="ae")
         if p['adx_enabled']:
@@ -716,13 +764,42 @@ with st.sidebar:
         if p['supertrend_enabled']:
             p['supertrend_period'] = st.slider("Period", 5, 20, p['supertrend_period'], key="stp")
             p['supertrend_multiplier'] = st.slider("Mult", 1.0, 5.0, p['supertrend_multiplier'], 0.5, key="stm")
-    with st.expander("📈 VWAP", expanded=False): p['vwap_enabled'] = st.toggle("Enable", p['vwap_enabled'], key="vwe")
+    with st.expander("📈 VWAP", expanded=False):
+        p['vwap_enabled'] = st.toggle("Enable", p['vwap_enabled'], key="vwe")
     with st.expander("📈 MACD", expanded=False):
         p['macd_enabled'] = st.toggle("Enable", p['macd_enabled'], key="mce")
         if p['macd_enabled']:
             p['macd_fast'] = st.slider("Fast", 5, 20, p['macd_fast'], key="mcf")
             p['macd_slow'] = st.slider("Slow", 15, 40, p['macd_slow'], key="mcs")
             p['macd_signal'] = st.slider("Signal", 5, 15, p['macd_signal'], key="mcsi")
+
+    # ── Visual Indicators (display-only — not strategy filters) ───────────────
+    st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
+    st.markdown("### 🔭 Visual Indicators")
+
+    with st.expander("📐 HPDR Bands", expanded=False):
+        p['hpdr_enabled'] = st.toggle("Show on chart", p['hpdr_enabled'], key="hpdr_e")
+        if p['hpdr_enabled']:
+            p['hpdr_lookback'] = st.slider("Lookback", 30, 504, p['hpdr_lookback'], key="hpdr_lb",
+                help="Rolling window for return distribution (bars). 252 ≈ 1 trading year.")
+            st.caption("5 zones: teal (±0.5σ) → green → yellow → orange → red (±2.5σ)")
+            st.caption("Y-axis is always locked to price range.")
+
+    with st.expander("〰️ RSI Hidden Divergence", expanded=False):
+        p['rsi_div_enabled'] = st.toggle("Show on chart", p['rsi_div_enabled'], key="rdiv_e")
+        if p['rsi_div_enabled']:
+            p['rsi_div_length'] = st.slider("RSI Length", 7, 21, p['rsi_div_length'], key="rdiv_l")
+            c1, c2 = st.columns(2)
+            p['rsi_div_pivot_left']  = c1.slider("Pivot Left",  2, 10, p['rsi_div_pivot_left'],  key="rdiv_pl",
+                help="Bars left of swing required to confirm a pivot.")
+            p['rsi_div_pivot_right'] = c2.slider("Pivot Right", 2, 10, p['rsi_div_pivot_right'], key="rdiv_pr",
+                help="Bars right required — equals signal lag.")
+            st.caption(f"⚠️ Signal lag = {p['rsi_div_pivot_right']} bars")
+            st.caption("🟢 Hidden Bull = Higher Low price + Lower Low RSI")
+            st.caption("🔴 Hidden Bear = Lower High price + Higher High RSI")
+
+    # ── Exits ──────────────────────────────────────────────────────────────────
+    st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
     st.markdown("### 🚪 Exits")
     with st.expander("🛑 Stop Loss", expanded=False):
         p['stop_loss_enabled'] = st.toggle("Enable", p['stop_loss_enabled'], key="sle")
@@ -742,7 +819,8 @@ with st.sidebar:
         if p['atr_trailing_enabled']:
             p['atr_length'] = st.slider("Length", 7, 21, p['atr_length'], key="atl")
             p['atr_multiplier'] = st.slider("Mult", 1.0, 5.0, p['atr_multiplier'], 0.5, key="atm")
-    with st.expander("📊 PAMRP Exit", expanded=False): p['pamrp_exit_enabled'] = st.toggle("Enable", p['pamrp_exit_enabled'], key="pxe")
+    with st.expander("📊 PAMRP Exit", expanded=False):
+        p['pamrp_exit_enabled'] = st.toggle("Enable", p['pamrp_exit_enabled'], key="pxe")
     with st.expander("📈 Stoch RSI Exit", expanded=False):
         p['stoch_rsi_exit_enabled'] = st.toggle("Enable", p['stoch_rsi_exit_enabled'], key="sre")
         if p['stoch_rsi_exit_enabled']:
@@ -762,6 +840,7 @@ with st.sidebar:
     with st.expander("📊 BBWP Exit", expanded=False):
         p['bbwp_exit_enabled'] = st.toggle("Enable", p['bbwp_exit_enabled'], key="bxe")
         if p['bbwp_exit_enabled']: p['bbwp_exit_threshold'] = st.slider("Threshold", 60, 95, p['bbwp_exit_threshold'], key="bxt")
+
 st.session_state.params = p
 
 
@@ -784,12 +863,15 @@ with tabs[0]:
         st.markdown("<br>", unsafe_allow_html=True)
         run = st.button("🚀 Run", type="primary", use_container_width=True)
     if run:
-        if st.session_state.df is None: st.warning("Load data first!")
+        if st.session_state.df is None:
+            st.warning("Load data first!")
         else:
             with st.spinner("Running..."):
-                engine = BacktestEngine(params_to_strategy(st.session_state.params), st.session_state.capital, st.session_state.commission, slippage)
+                engine = BacktestEngine(params_to_strategy(st.session_state.params),
+                    st.session_state.capital, st.session_state.commission, slippage)
                 st.session_state.backtest_results = engine.run(st.session_state.df.copy())
                 st.success(f"✅ {st.session_state.backtest_results.num_trades} trades")
+
     if st.session_state.backtest_results:
         r = st.session_state.backtest_results
         c1,c2,c3,c4,c5,c6 = st.columns(6)
@@ -820,231 +902,162 @@ with tabs[0]:
             c3.metric("Avg MAE", f"{r.avg_mae:.2f}%")
             c4.metric("Avg MFE", f"{r.avg_mfe:.2f}%")
         st.plotly_chart(create_equity_chart(r), use_container_width=True)
-        if st.session_state.df is not None:
-            st.plotly_chart(create_price_chart_with_trades(st.session_state.df, r.trades), use_container_width=True)
-    elif st.session_state.df is not None:
-        st.plotly_chart(create_price_chart_with_trades(st.session_state.df, None), use_container_width=True)
+
+    # ── Price chart (with optional HPDR overlay) ──────────────────────────────
+    if st.session_state.df is not None:
+        df_chart = st.session_state.df
+
+        bands_data = None
+        if p.get('hpdr_enabled'):
+            try:
+                bands_data = hpdr_bands(
+                    df_chart['close'],
+                    lookback=int(p.get('hpdr_lookback', 252)),
+                    z_scores=(0.5, 1.0, 1.5, 2.0, 2.5),
+                )
+            except Exception as e:
+                st.warning(f"HPDR bands error: {e}")
+
+        trades_to_show = st.session_state.backtest_results.trades if st.session_state.backtest_results else None
+        st.plotly_chart(
+            create_price_chart_with_trades(df_chart, trades_to_show, bands=bands_data),
+            use_container_width=True,
+        )
+
+        # ── RSI Hidden Divergence sub-panel ───────────────────────────────────
+        if p.get('rsi_div_enabled'):
+            min_bars = 2 * (p['rsi_div_pivot_left'] + p['rsi_div_pivot_right'] + p['rsi_div_length'])
+            if len(df_chart) < min_bars:
+                st.warning(f"RSI Divergence needs at least {min_bars} bars. Load more data.")
+            else:
+                try:
+                    st.markdown("##### 〰️ RSI Hidden Divergence")
+                    st.caption(
+                        f"RSI({p['rsi_div_length']}) · "
+                        f"Pivot {p['rsi_div_pivot_left']}/{p['rsi_div_pivot_right']} · "
+                        f"Signal lag = {p['rsi_div_pivot_right']} bars"
+                    )
+                    st.plotly_chart(
+                        create_rsi_divergence_chart(df_chart, p),
+                        use_container_width=True,
+                    )
+                except Exception as e:
+                    st.warning(f"RSI Divergence chart error: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# OPTIMIZE TAB  (v7: updated for optimize module v8)
+# OPTIMIZE TAB  (v7)
 # ═══════════════════════════════════════════════════════════════════════════════
 with tabs[1]:
     st.markdown("### 🎯 Optimization")
 
-    # ── Row 1: core settings ──────────────────────────────────────────────────
     c1,c2,c3,c4 = st.columns(4)
     opt_metric = c1.selectbox("Metric", ["profit_factor","sharpe_ratio","total_return_pct","sortino_ratio"])
     opt_dir = c2.selectbox("Dir", ["long_only","short_only","both"])
     opt_trials = c3.slider("Trials", 50, 500, 200)
     opt_min = c4.slider("Min Trades", 5, 30, 10)
 
-    # ── Row 2: split / WFO settings ──────────────────────────────────────────
     c1,c2,c3 = st.columns(3)
     train_pct = c1.slider("Train %", 50, 90, 70)
     use_wf = c2.toggle("Walk-Forward", True)
     n_folds = c3.slider("Folds", 3, 10, 5) if use_wf else 5
 
-    # ── Row 3: WFO-specific controls ─────────────────────────────────────────
     window_type = 'rolling'
     train_window_bars = None
     if use_wf:
         c1, c2, c3 = st.columns(3)
-        window_type = c1.selectbox(
-            "Window Type", ["rolling", "anchored"], index=0,
-            help="Rolling: fixed-size sliding window (recommended for non-stationary markets). "
-                 "Anchored: expanding from bar 0."
-        )
+        window_type = c1.selectbox("Window Type", ["rolling", "anchored"], index=0,
+            help="Rolling: fixed-size sliding window. Anchored: expanding from bar 0.")
         if window_type == 'rolling' and st.session_state.df is not None:
             default_bars = int(len(st.session_state.df) * train_pct / 100)
-            train_window_bars = c2.slider(
-                "Train Window (bars)", min_value=50,
+            train_window_bars = c2.slider("Train Window (bars)", min_value=50,
                 max_value=max(51, len(st.session_state.df) - 20),
-                value=min(default_bars, max(50, len(st.session_state.df) - 20)),
-            )
+                value=min(default_bars, max(50, len(st.session_state.df) - 20)))
         elif window_type == 'rolling':
             c2.caption("Load data to configure window size.")
 
-    # ── Pin Parameters panel ──────────────────────────────────────────────────
-    # Full catalogue of params that can be pinned per indicator.
-    # Only indicators that are currently enabled appear in the panel.
     _PINNABLE: Dict[str, list] = {
-        'pamrp_enabled': [
-            ('pamrp_length',      'Length'),
-            ('pamrp_entry_long',  'Entry Long'),
-            ('pamrp_entry_short', 'Entry Short'),
-            ('pamrp_exit_long',   'Exit Long'),
-            ('pamrp_exit_short',  'Exit Short'),
-        ],
-        'bbwp_enabled': [
-            ('bbwp_length',          'Length'),
-            ('bbwp_lookback',        'Lookback'),
-            ('bbwp_sma_length',      'SMA Length'),
-            ('bbwp_ma_filter',       'MA Filter'),
-            ('bbwp_threshold_long',  'Threshold Long'),
-            ('bbwp_threshold_short', 'Threshold Short'),
-        ],
-        'adx_enabled': [
-            ('adx_length',    'Length'),
-            ('adx_smoothing', 'Smoothing'),
-            ('adx_threshold', 'Threshold'),
-        ],
-        'ma_trend_enabled': [
-            ('ma_type',        'Type'),
-            ('ma_fast_length', 'Fast Length'),
-            ('ma_slow_length', 'Slow Length'),
-        ],
-        'rsi_enabled': [
-            ('rsi_length',    'Length'),
-            ('rsi_oversold',  'Oversold'),
-            ('rsi_overbought','Overbought'),
-        ],
-        'volume_enabled': [
-            ('volume_ma_length',  'MA Length'),
-            ('volume_multiplier', 'Multiplier'),
-        ],
-        'supertrend_enabled': [
-            ('supertrend_period',     'Period'),
-            ('supertrend_multiplier', 'Multiplier'),
-        ],
-        'macd_enabled': [
-            ('macd_fast',   'Fast'),
-            ('macd_slow',   'Slow'),
-            ('macd_signal', 'Signal'),
-        ],
-        'stop_loss_enabled': [
-            ('stop_loss_pct_long',  '% Long'),
-            ('stop_loss_pct_short', '% Short'),
-        ],
-        'take_profit_enabled': [
-            ('take_profit_pct_long',  '% Long'),
-            ('take_profit_pct_short', '% Short'),
-        ],
-        'trailing_stop_enabled': [
-            ('trailing_stop_pct', 'Trail %'),
-        ],
-        'atr_trailing_enabled': [
-            ('atr_length',     'Length'),
-            ('atr_multiplier', 'Multiplier'),
-        ],
-        'time_exit_enabled': [
-            ('time_exit_bars', 'Max Bars'),
-        ],
-        'ma_exit_enabled': [
-            ('ma_exit_fast', 'Fast'),
-            ('ma_exit_slow', 'Slow'),
-        ],
-        'bbwp_exit_enabled': [
-            ('bbwp_exit_threshold', 'Threshold'),
-        ],
+        'pamrp_enabled': [('pamrp_length','Length'),('pamrp_entry_long','Entry Long'),
+            ('pamrp_entry_short','Entry Short'),('pamrp_exit_long','Exit Long'),('pamrp_exit_short','Exit Short')],
+        'bbwp_enabled': [('bbwp_length','Length'),('bbwp_lookback','Lookback'),('bbwp_sma_length','SMA Length'),
+            ('bbwp_ma_filter','MA Filter'),('bbwp_threshold_long','Thresh Long'),('bbwp_threshold_short','Thresh Short')],
+        'adx_enabled': [('adx_length','Length'),('adx_smoothing','Smoothing'),('adx_threshold','Threshold')],
+        'ma_trend_enabled': [('ma_type','Type'),('ma_fast_length','Fast'),('ma_slow_length','Slow')],
+        'rsi_enabled': [('rsi_length','Length'),('rsi_oversold','Oversold'),('rsi_overbought','Overbought')],
+        'volume_enabled': [('volume_ma_length','MA Length'),('volume_multiplier','Multiplier')],
+        'supertrend_enabled': [('supertrend_period','Period'),('supertrend_multiplier','Multiplier')],
+        'macd_enabled': [('macd_fast','Fast'),('macd_slow','Slow'),('macd_signal','Signal')],
+        'stop_loss_enabled': [('stop_loss_pct_long','% Long'),('stop_loss_pct_short','% Short')],
+        'take_profit_enabled': [('take_profit_pct_long','% Long'),('take_profit_pct_short','% Short')],
+        'trailing_stop_enabled': [('trailing_stop_pct','Trail %')],
+        'atr_trailing_enabled': [('atr_length','Length'),('atr_multiplier','Multiplier')],
+        'time_exit_enabled': [('time_exit_bars','Max Bars')],
+        'ma_exit_enabled': [('ma_exit_fast','Fast'),('ma_exit_slow','Slow')],
+        'bbwp_exit_enabled': [('bbwp_exit_threshold','Threshold')],
     }
-
-    # Indicator display names for the panel header
     _INDICATOR_LABELS: Dict[str, str] = {
-        'pamrp_enabled': 'PAMRP', 'bbwp_enabled': 'BBWP', 'adx_enabled': 'ADX',
-        'ma_trend_enabled': 'MA Trend', 'rsi_enabled': 'RSI', 'volume_enabled': 'Volume',
-        'supertrend_enabled': 'Supertrend', 'macd_enabled': 'MACD',
-        'stop_loss_enabled': 'Stop Loss', 'take_profit_enabled': 'Take Profit',
-        'trailing_stop_enabled': 'Trailing Stop', 'atr_trailing_enabled': 'ATR Trail',
-        'time_exit_enabled': 'Time Exit', 'ma_exit_enabled': 'MA Exit',
-        'bbwp_exit_enabled': 'BBWP Exit',
+        'pamrp_enabled':'PAMRP','bbwp_enabled':'BBWP','adx_enabled':'ADX',
+        'ma_trend_enabled':'MA Trend','rsi_enabled':'RSI','volume_enabled':'Volume',
+        'supertrend_enabled':'Supertrend','macd_enabled':'MACD',
+        'stop_loss_enabled':'Stop Loss','take_profit_enabled':'Take Profit',
+        'trailing_stop_enabled':'Trailing Stop','atr_trailing_enabled':'ATR Trail',
+        'time_exit_enabled':'Time Exit','ma_exit_enabled':'MA Exit','bbwp_exit_enabled':'BBWP Exit',
     }
-
-    # Only show indicators that are enabled in the sidebar
-    enabled_pinnable = [
-        (ind_key, _INDICATOR_LABELS.get(ind_key, ind_key), params_list)
+    enabled_pinnable = [(ind_key, _INDICATOR_LABELS.get(ind_key, ind_key), params_list)
         for ind_key, params_list in _PINNABLE.items()
-        if st.session_state.params.get(ind_key, False)
-    ]
+        if st.session_state.params.get(ind_key, False)]
 
-    pinned_set: set = st.session_state.pinned_params  # mutated in place
+    pinned_set: set = st.session_state.pinned_params
 
     if enabled_pinnable:
         with st.expander("🔒 Pin Parameters (hold fixed during optimization)", expanded=False):
-            st.caption(
-                "Checked parameters are fixed at their current sidebar values and excluded "
-                "from the search space. Fewer free parameters = better TPE convergence."
-            )
+            st.caption("Checked parameters are fixed at their current sidebar values and excluded from the search space.")
             if st.button("Clear all pins", key="_clear_pins"):
                 st.session_state.pinned_params = set()
                 st.rerun()
-
             for ind_key, ind_label, param_list in enabled_pinnable:
                 st.markdown(f"**{ind_label}**")
                 cols = st.columns(min(len(param_list), 3))
                 for idx, (pname, plabel) in enumerate(param_list):
                     current_val = st.session_state.params.get(pname, '—')
                     col = cols[idx % len(cols)]
-                    checked = col.checkbox(
-                        f"{plabel}  `{current_val}`",
-                        value=(pname in pinned_set),
-                        key=f"_pin_{pname}",
-                    )
-                    if checked:
-                        pinned_set.add(pname)
-                    else:
-                        pinned_set.discard(pname)
+                    checked = col.checkbox(f"{plabel}  `{current_val}`", value=(pname in pinned_set), key=f"_pin_{pname}")
+                    if checked: pinned_set.add(pname)
+                    else: pinned_set.discard(pname)
         st.session_state.pinned_params = pinned_set
-
         if pinned_set:
             pinned_names = ', '.join(
                 next((pl for pk, pl in p_list if pk == k), k)
                 for ind_key, _, p_list in enabled_pinnable
-                for k in pinned_set
-                if any(pk == k for pk, _ in p_list)
+                for k in pinned_set if any(pk == k for pk, _ in p_list)
             )
             st.caption(f"🔒 Pinned: **{pinned_names}**")
 
-    # ── Active indicators display ─────────────────────────────────────────────
     active_display = get_active_filters_display(st.session_state.params)
-    if active_display:
-        st.caption(f"🔍 Active: **{', '.join(active_display)}**")
+    if active_display: st.caption(f"🔍 Active: **{', '.join(active_display)}**")
 
-    # ── Run button ────────────────────────────────────────────────────────────
     if st.button("🎯 Optimize", type="primary", use_container_width=True):
         if st.session_state.df is None:
             st.warning("Load data first!")
         else:
             ef = {k: v for k, v in st.session_state.params.items() if k.endswith('_enabled')}
-            # Build pinned_params dict: name → current sidebar value
-            pinned_dict = {
-                k: st.session_state.params[k]
-                for k in st.session_state.pinned_params
-                if k in st.session_state.params
-            }
+            pinned_dict = {k: st.session_state.params[k] for k in st.session_state.pinned_params if k in st.session_state.params}
             with st.spinner("Optimizing..."):
-                res = optimize_strategy(
-                    df=st.session_state.df.copy(),
-                    enabled_filters=ef,
-                    metric=opt_metric,
-                    n_trials=opt_trials,
-                    min_trades=opt_min,
-                    initial_capital=st.session_state.capital,
-                    commission_pct=st.session_state.commission,
-                    trade_direction=opt_dir,
-                    train_pct=train_pct / 100,
-                    use_walkforward=use_wf,
-                    n_folds=n_folds,
-                    window_type=window_type,
-                    train_window_bars=train_window_bars,
-                    show_progress=False,
-                    pinned_params=pinned_dict if pinned_dict else None,
-                )
+                res = optimize_strategy(df=st.session_state.df.copy(), enabled_filters=ef,
+                    metric=opt_metric, n_trials=opt_trials, min_trades=opt_min,
+                    initial_capital=st.session_state.capital, commission_pct=st.session_state.commission,
+                    trade_direction=opt_dir, train_pct=train_pct/100, use_walkforward=use_wf,
+                    n_folds=n_folds, window_type=window_type, train_window_bars=train_window_bars,
+                    show_progress=False, pinned_params=pinned_dict if pinned_dict else None)
                 st.session_state.optimization_results = res
                 st.success("✅ Done!")
 
-    # ── Results display ───────────────────────────────────────────────────────
     if st.session_state.optimization_results:
         res = st.session_state.optimization_results
         ml = res.metric.replace('_', ' ').title()
-
-        # Warnings — shown first
         if res.warnings:
             with st.expander(f"⚠️ {len(res.warnings)} Robustness Warning(s)", expanded=True):
-                for w in res.warnings:
-                    st.warning(w)
-
-        # Core metrics row
+                for w in res.warnings: st.warning(w)
         c1,c2,c3,c4 = st.columns(4)
         c1.metric(f"Train ({ml})", f"{res.train_value:.4f}")
         c2.metric(f"OOS ({ml})", f"{res.test_value:.4f}")
@@ -1058,48 +1071,37 @@ with tabs[1]:
         if res.train_value > 0:
             deg = ((res.train_value - res.test_value) / res.train_value) * 100
             c4.metric("IS→OOS Degradation", f"{deg:.1f}%", delta_color="normal" if deg < 30 else "inverse")
-
-        # Walk-forward charts
         if res.walkforward_folds:
             st.markdown("#### Walk-Forward Fold Performance")
             st.caption(f"Window: **{res.window_type}** | Folds: **{len(res.walkforward_folds)}**")
-            st.plotly_chart(create_walkforward_chart(res.walkforward_folds),
-                            use_container_width=True, config={'displayModeBar': False})
+            st.plotly_chart(create_walkforward_chart(res.walkforward_folds), use_container_width=True, config={'displayModeBar': False})
             if res.stitched_equity is not None and len(res.stitched_equity) > 0:
                 st.markdown("#### 📈 Stitched OOS Equity Curve")
                 st.caption("Each segment is a genuine out-of-sample period — the only unbiased performance view for WFO.")
                 st.plotly_chart(create_stitched_equity_chart(res.stitched_equity), use_container_width=True)
-
-        # Best params + full-data performance
         c1, c2 = st.columns(2)
         with c1:
             st.markdown("### Best Params")
-            # Mark pinned params visually
             pp = res.pinned_params or {}
             rows = []
             for k, v in res.best_params.items():
-                if k.startswith('trade_direction') or isinstance(v, TradeDirection):
-                    continue
-                locked = "🔒 " if k in pp else ""
-                rows.append({"Parameter": f"{locked}{k}", "Value": str(v)[:25]})
+                if k.startswith('trade_direction') or isinstance(v, TradeDirection): continue
+                rows.append({"Parameter": f"{'🔒 ' if k in pp else ''}{k}", "Value": str(v)[:25]})
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=280)
-            if pp:
-                st.caption(f"🔒 = fixed at sidebar value ({len(pp)} pinned)")
+            if pp: st.caption(f"🔒 = fixed at sidebar value ({len(pp)} pinned)")
         with c2:
             br = res.full_data_results
             st.markdown("### Full-Data Performance")
-            st.caption("⚠ Includes in-sample periods. For WFO, refer to the stitched OOS chart above.")
+            st.caption("⚠ Includes in-sample periods. For WFO, refer to the stitched OOS chart.")
             st.dataframe(pd.DataFrame([
-                {"Metric": "Return",   "Value": f"{br.total_return_pct:.2f}%"},
-                {"Metric": "CAGR",     "Value": f"{br.cagr:.2f}%"},
-                {"Metric": "Sharpe",   "Value": f"{br.sharpe_ratio:.3f}"},
-                {"Metric": "Max DD",   "Value": f"{br.max_drawdown_pct:.2f}%"},
-                {"Metric": "Trades",   "Value": str(br.num_trades)},
+                {"Metric":"Return","Value":f"{br.total_return_pct:.2f}%"},
+                {"Metric":"CAGR","Value":f"{br.cagr:.2f}%"},
+                {"Metric":"Sharpe","Value":f"{br.sharpe_ratio:.3f}"},
+                {"Metric":"Max DD","Value":f"{br.max_drawdown_pct:.2f}%"},
+                {"Metric":"Trades","Value":str(br.num_trades)},
             ]), use_container_width=True, hide_index=True)
-
         if not res.all_trials.empty:
             st.plotly_chart(create_optimization_chart(res.all_trials, res.metric), use_container_width=True)
-
         st.button("📋 Apply Best Params", on_click=apply_best_params_callback, use_container_width=True)
         if st.session_state.pop('_apply_success', False):
             st.success(f"✅ Applied! Capital: ${st.session_state.capital:,.0f} | Commission: {st.session_state.commission}%")
@@ -1113,19 +1115,20 @@ with tabs[2]:
     if st.session_state.df is not None:
         if st.button("🔄 Compare", use_container_width=True):
             df = st.session_state.df.copy()
-            strat_res = BacktestEngine(params_to_strategy(st.session_state.params), st.session_state.capital, st.session_state.commission).run(df)
+            strat_res = BacktestEngine(params_to_strategy(st.session_state.params),
+                st.session_state.capital, st.session_state.commission).run(df)
             if strat_res.trades:
                 ft = strat_res.trades[0]; ep = ft.entry_price; ed = ft.entry_date; fp = df['close'].iloc[-1]
                 bh_pct = ((ep - fp) / ep * 100) if ft.direction == 'short' else ((fp - ep) / ep * 100)
                 mask = df.index >= ed; prices = df.loc[mask, 'close']
                 peak = prices.expanding().max(); bh_dd = ((prices - peak) / peak * 100).min()
                 st.dataframe(pd.DataFrame([
-                    {'Strategy': '📊 Yours', 'Return %': f"{strat_res.total_return_pct:.2f}%", 'CAGR': f"{strat_res.cagr:.2f}%", 'Max DD': f"{strat_res.max_drawdown_pct:.2f}%", 'Sharpe': f"{strat_res.sharpe_ratio:.3f}"},
-                    {'Strategy': '📈 B&H', 'Return %': f"{bh_pct:.2f}%", 'CAGR': '-', 'Max DD': f"{bh_dd:.2f}%", 'Sharpe': '-'}
+                    {'Strategy':'📊 Yours','Return %':f"{strat_res.total_return_pct:.2f}%",'CAGR':f"{strat_res.cagr:.2f}%",'Max DD':f"{strat_res.max_drawdown_pct:.2f}%",'Sharpe':f"{strat_res.sharpe_ratio:.3f}"},
+                    {'Strategy':'📈 B&H','Return %':f"{bh_pct:.2f}%",'CAGR':'-','Max DD':f"{bh_dd:.2f}%",'Sharpe':'-'}
                 ]), use_container_width=True, hide_index=True)
                 diff = strat_res.total_return_pct - bh_pct
                 (st.success if diff > 0 else st.warning)(f"{'🏆 Strategy beats' if diff > 0 else '📉 B&H beats strategy by'} {abs(diff):.2f}%")
-                ba = calculate_beta_alpha(strat_res.equity_curve.pct_change().dropna(), df.loc[mask, 'close'].pct_change().dropna())
+                ba = calculate_beta_alpha(strat_res.equity_curve.pct_change().dropna(), df.loc[mask,'close'].pct_change().dropna())
                 c1,c2,c3 = st.columns(3)
                 c1.metric("Beta", f"{ba['beta']:.3f}"); c2.metric("Alpha (ann)", f"{ba['alpha']:.2f}%"); c3.metric("Correlation", f"{ba['correlation']:.3f}")
             else: st.warning("No trades generated")
@@ -1141,7 +1144,7 @@ with tabs[3]:
     mc_method = c1.selectbox("Method", ["Trade Shuffle", "Return Bootstrap", "Noise Injection"])
     n_sims = c2.slider("Simulations", 100, 5000, 1000)
     ruin_pct = c3.slider("Ruin Threshold %", 10, 90, 50)
-    method_map = {"Trade Shuffle": "trade_shuffle", "Return Bootstrap": "return_bootstrap", "Noise Injection": "noise_injection"}
+    method_map = {"Trade Shuffle":"trade_shuffle","Return Bootstrap":"return_bootstrap","Noise Injection":"noise_injection"}
     method_key = method_map[mc_method]
     extra_kwargs = {}
     if method_key == 'noise_injection': extra_kwargs['noise_pct'] = st.slider("Noise %", 5.0, 50.0, 20.0, 5.0)
@@ -1154,6 +1157,7 @@ with tabs[3]:
                     n_simulations=n_sims, initial_capital=st.session_state.capital, ruin_pct=ruin_pct,
                     bars_per_year=r.bars_per_year, **extra_kwargs)
                 if mc: st.session_state._mc_result = mc
+        else: st.warning("Run backtest first!")
     mc = st.session_state.get('_mc_result')
     if mc:
         c1,c2,c3,c4 = st.columns(4)
@@ -1182,8 +1186,6 @@ with tabs[3]:
 # ═══════════════════════════════════════════════════════════════════════════════
 # CALENDAR ANALYTICS TAB
 # ═══════════════════════════════════════════════════════════════════════════════
-# CALENDAR TAB
-# ═══════════════════════════════════════════════════════════════════════════════
 with tabs[4]:
     st.markdown("### 📅 Calendar Analytics")
     if st.session_state.df is None:
@@ -1194,102 +1196,66 @@ with tabs[4]:
                 cal = analyze_calendar(st.session_state.df)
                 st.session_state._calendar = cal
                 if st.session_state.backtest_results and st.session_state.backtest_results.trades:
-                    st.session_state._trade_calendar = analyze_trade_calendar(
-                        st.session_state.backtest_results.trades
-                    )
-
+                    st.session_state._trade_calendar = analyze_trade_calendar(st.session_state.backtest_results.trades)
         cal = st.session_state.get('_calendar')
         if cal:
-            # ── Summary headline row ───────────────────────────────────────────
             ss = cal.summary_stats
             if ss:
-                c1, c2, c3, c4, c5 = st.columns(5)
-                c1.metric("Observations", f"{ss.get('total_observations', 0):,}")
-                c2.metric("Daily Win Rate", f"{ss.get('overall_win_rate', 0):.1f}%")
-                c3.metric("Best Day", ss.get('best_day', '—'),
-                          delta=f"avg {ss.get('best_day_avg', 0):+.4f}%")
-                c4.metric("Best Month", ss.get('best_month', '—'),
-                          delta=f"avg {ss.get('best_month_avg', 0):+.2f}%")
-                c5.metric("Ann. Return (daily avg)", f"{ss.get('annualized_return', 0):+.2f}%")
+                c1,c2,c3,c4,c5 = st.columns(5)
+                c1.metric("Observations", f"{ss.get('total_observations',0):,}")
+                c2.metric("Daily Win Rate", f"{ss.get('overall_win_rate',0):.1f}%")
+                c3.metric("Best Day", ss.get('best_day','—'), delta=f"avg {ss.get('best_day_avg',0):+.4f}%")
+                c4.metric("Best Month", ss.get('best_month','—'), delta=f"avg {ss.get('best_month_avg',0):+.2f}%")
+                c5.metric("Ann. Return (daily avg)", f"{ss.get('annualized_return',0):+.2f}%")
                 st.markdown("---")
-
-            # ── Consecutive stats row ──────────────────────────────────────────
             cons = cal.consecutive
-            c1, c2, c3, c4, c5 = st.columns(5)
-            c1.metric("Max Win Streak",  f"{cons.max_win_streak}d")
+            c1,c2,c3,c4,c5 = st.columns(5)
+            c1.metric("Max Win Streak", f"{cons.max_win_streak}d")
             c2.metric("Max Loss Streak", f"{cons.max_loss_streak}d")
-            c3.metric("Avg Win Streak",  f"{cons.avg_win_streak:.1f}d")
+            c3.metric("Avg Win Streak", f"{cons.avg_win_streak:.1f}d")
             c4.metric("Avg Loss Streak", f"{cons.avg_loss_streak:.1f}d")
             cur = cons.current_streak
-            c5.metric("Current Streak",
-                      f"{'🟢' if cur >= 0 else '🔴'} {abs(cur)}d",
-                      delta="winning" if cur >= 0 else "losing",
-                      delta_color="normal" if cur >= 0 else "inverse")
+            c5.metric("Current Streak", f"{'🟢' if cur>=0 else '🔴'} {abs(cur)}d",
+                delta="winning" if cur>=0 else "losing", delta_color="normal" if cur>=0 else "inverse")
             st.markdown("---")
-
-            # ── Day of Week ────────────────────────────────────────────────────
             st.markdown("#### 📆 Day-of-Week Returns")
-            st.caption("Daily returns resampled to business days. Intraday data aggregated correctly.")
-            st.plotly_chart(create_dow_chart(cal.day_of_week_df), use_container_width=True,
-                            config={'displayModeBar': False})
+            st.plotly_chart(create_dow_chart(cal.day_of_week_df), use_container_width=True, config={'displayModeBar': False})
             with st.expander("📋 Day-of-Week Table", expanded=False):
                 st.dataframe(cal.day_of_week_df, use_container_width=True, hide_index=True)
-
             st.markdown("---")
-
-            # ── Monthly Seasonality ────────────────────────────────────────────
             st.markdown("#### 🗓️ Monthly Seasonality")
-            st.plotly_chart(create_monthly_bar_chart(cal.monthly_df), use_container_width=True,
-                            config={'displayModeBar': False})
+            st.plotly_chart(create_monthly_bar_chart(cal.monthly_df), use_container_width=True, config={'displayModeBar': False})
             if not cal.monthly_heatmap.empty:
                 st.markdown("**Year × Month Heatmap**")
-                st.plotly_chart(create_monthly_heatmap(cal.monthly_heatmap),
-                                use_container_width=True, config={'displayModeBar': False})
+                st.plotly_chart(create_monthly_heatmap(cal.monthly_heatmap), use_container_width=True, config={'displayModeBar': False})
             with st.expander("📋 Monthly Table", expanded=False):
                 st.dataframe(cal.monthly_df, use_container_width=True, hide_index=True)
-
             st.markdown("---")
-
-            # ── Day of Month ───────────────────────────────────────────────────
             if not cal.day_of_month_df.empty:
                 st.markdown("#### 📅 Day-of-Month Effect")
-                st.caption("Average return by calendar day (1–31). Useful for scheduling entries.")
-                st.plotly_chart(create_dom_chart(cal.day_of_month_df), use_container_width=True,
-                                config={'displayModeBar': False})
+                st.plotly_chart(create_dom_chart(cal.day_of_month_df), use_container_width=True, config={'displayModeBar': False})
                 with st.expander("📋 Day-of-Month Table", expanded=False):
                     st.dataframe(cal.day_of_month_df, use_container_width=True, hide_index=True)
                 st.markdown("---")
-
-            # ── Hourly (intraday only) ─────────────────────────────────────────
             if cal.is_intraday and cal.hourly_df is not None:
                 st.markdown("#### ⏰ Hourly Returns")
-                st.caption("Average return per hour of day. Computed on 1h bars regardless of input frequency.")
-                st.plotly_chart(create_hourly_chart(cal.hourly_df), use_container_width=True,
-                                config={'displayModeBar': False})
+                st.plotly_chart(create_hourly_chart(cal.hourly_df), use_container_width=True, config={'displayModeBar': False})
                 with st.expander("📋 Hourly Table", expanded=False):
                     st.dataframe(cal.hourly_df, use_container_width=True, hide_index=True)
                 st.markdown("---")
-
-            # ── Return Distribution ────────────────────────────────────────────
             dist = cal.distribution
             if dist.bins:
                 st.markdown("#### 📊 Return Distribution")
-                c1, c2, c3, c4 = st.columns(4)
+                c1,c2,c3,c4 = st.columns(4)
                 c1.metric("Mean Daily", f"{dist.mean:+.4f}%")
-                c2.metric("Std Dev",    f"{dist.std:.4f}%")
-                c3.metric("Skewness",   f"{dist.skew:.3f}",
-                          help="Negative = left tail heavier (more large down days)")
-                c4.metric("Excess Kurtosis", f"{dist.kurtosis:.3f}",
-                          help="Positive = fat tails (more extreme moves than normal)")
-                st.plotly_chart(create_return_distribution_chart(dist),
-                                use_container_width=True, config={'displayModeBar': False})
+                c2.metric("Std Dev", f"{dist.std:.4f}%")
+                c3.metric("Skewness", f"{dist.skew:.3f}", help="Negative = left tail heavier")
+                c4.metric("Excess Kurtosis", f"{dist.kurtosis:.3f}", help="Positive = fat tails")
+                st.plotly_chart(create_return_distribution_chart(dist), use_container_width=True, config={'displayModeBar': False})
                 st.markdown("---")
-
-            # ── Trade Calendar (strategy-level) ───────────────────────────────
             tc = st.session_state.get('_trade_calendar')
             if tc and not tc.trades_by_day.empty:
                 st.markdown("#### 🎯 Strategy Trade Calendar")
-                st.caption("Entry day and month analysis from the most recent backtest.")
                 c1, c2 = st.columns(2)
                 with c1:
                     st.markdown("**By Entry Day**")
@@ -1312,7 +1278,9 @@ with tabs[5]:
     if st.button("🔥 Generate Heatmap", use_container_width=True):
         if st.session_state.df is not None:
             with st.spinner("Calculating..."):
-                st.plotly_chart(create_heatmap(st.session_state.df, p1, p2, hm_metric, st.session_state.params, st.session_state.capital, st.session_state.commission), use_container_width=True)
+                st.plotly_chart(create_heatmap(st.session_state.df, p1, p2, hm_metric,
+                    st.session_state.params, st.session_state.capital, st.session_state.commission),
+                    use_container_width=True)
         else: st.warning("Load data first")
 
 
@@ -1330,12 +1298,13 @@ with tabs[6]:
                 try:
                     end = datetime.now(); start = end - timedelta(days=730)
                     df = fetch_yfinance(sym, str(start.date()), str(end.date()), '1d')
-                    results_dict[sym] = BacktestEngine(params_to_strategy(st.session_state.params), st.session_state.capital, st.session_state.commission).run(df)
+                    results_dict[sym] = BacktestEngine(params_to_strategy(st.session_state.params),
+                        st.session_state.capital, st.session_state.commission).run(df)
                 except Exception as e: st.warning(f"{sym}: {str(e)[:30]}")
         if results_dict:
             st.plotly_chart(create_multi_asset_chart(results_dict), use_container_width=True)
-            st.dataframe(pd.DataFrame([{'Symbol': s, 'Return %': f"{r.total_return_pct:.2f}%", 'CAGR': f"{r.cagr:.2f}%",
-                'Sharpe': f"{r.sharpe_ratio:.3f}", 'Max DD': f"{r.max_drawdown_pct:.2f}%", 'Trades': r.num_trades}
+            st.dataframe(pd.DataFrame([{'Symbol':s,'Return %':f"{r.total_return_pct:.2f}%",'CAGR':f"{r.cagr:.2f}%",
+                'Sharpe':f"{r.sharpe_ratio:.3f}",'Max DD':f"{r.max_drawdown_pct:.2f}%",'Trades':r.num_trades}
                 for s, r in results_dict.items()]), use_container_width=True, hide_index=True)
 
 
@@ -1371,4 +1340,4 @@ with tabs[7]:
 
 
 st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
-st.markdown('<p style="text-align:center;color:#64748b;font-size:0.7rem;">Strategy Lab v7.0</p>', unsafe_allow_html=True)
+st.markdown('<p style="text-align:center;color:#64748b;font-size:0.7rem;">Strategy Lab v7.1</p>', unsafe_allow_html=True)
