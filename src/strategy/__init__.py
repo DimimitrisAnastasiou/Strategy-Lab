@@ -261,7 +261,7 @@ class SignalGenerator:
         if p.bbwp_enabled:
             has_any_filter = True
             long_signal  = long_signal  & (df['bbwp'] < p.bbwp_threshold_long)
-            short_signal = short_signal & (df['bbwp'] < p.bbwp_threshold_short)
+            short_signal = short_signal & (df['bbwp'] > p.bbwp_threshold_short)
 
             if p.bbwp_ma_filter == 'decreasing':
                 bbwp_ma_ok   = df['bbwp_sma'] < df['bbwp_sma'].shift(1)
