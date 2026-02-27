@@ -568,8 +568,7 @@ class BayesianOptimizer:
         ate = ef.get('atr_trailing_enabled', False)
         atl = p_int('atr_length',         10,  20) if ate else 14
         atm = p_float('atr_multiplier', 1.5, 4.0) if ate else 2.0
-
-        pxe = ef.get('pamrp_exit_enabled', True)
+   
         sre = ef.get('stoch_rsi_exit_enabled', False)
 
         txe = ef.get('time_exit_enabled', False)
