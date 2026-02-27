@@ -61,7 +61,7 @@ def render_optimize_tab() -> None:
     c1, c2, c3, c4 = st.columns(4)
     opt_metric = c1.selectbox("Metric", ["profit_factor", "sharpe_ratio", "total_return_pct", "sortino_ratio"])
     opt_dir = c2.selectbox("Dir", ["long_only", "short_only", "both"])
-    opt_trials = c3.slider("Trials", 50, 500, 200)
+    opt_trials = c3.slider("Trials", 50, 1500, 500)
     opt_min = c4.slider("Min Trades", 5, 30, 10)
 
     c1, c2, c3 = st.columns(3)
