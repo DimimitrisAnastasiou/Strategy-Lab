@@ -23,7 +23,7 @@ from src.strategy import StrategyParams, TradeDirection
 
 PARAM_TO_WIDGET_KEY: Dict[str, str] = {
     'pamrp_enabled': 'pe', 'pamrp_length': 'pl', 'pamrp_entry_long': 'pel', 'pamrp_entry_short': 'pes',
-    'pamrp_exit_long': 'pxl', 'pamrp_exit_short': 'pxs',
+    'pamrp_exit_long': 'pxl_exit', 'pamrp_exit_short': 'pxs_exit',
     'bbwp_enabled': 'be', 'bbwp_length': 'bl', 'bbwp_lookback': 'blb', 'bbwp_sma_length': 'bsma',
     'bbwp_threshold_long': 'btl', 'bbwp_threshold_short': 'bts', 'bbwp_ma_filter': 'bmf',
     'adx_enabled': 'ae', 'adx_length': 'al', 'adx_threshold': 'at',
