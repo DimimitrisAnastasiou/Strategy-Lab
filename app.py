@@ -56,7 +56,7 @@ tabs = st.tabs([
     "🔥 Heatmap",
     "🌐 Multi-Asset",
     "📋 Trades",
-    "📆 A Trade A Day",
+    "☝️ A Trade A Day",
 ])
 
 with tabs[0]:
