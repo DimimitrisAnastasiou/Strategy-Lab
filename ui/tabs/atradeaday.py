@@ -28,7 +28,7 @@ def render_atradeaday_tab() -> None:
     )
     with c4:
         st.markdown("<br>", unsafe_allow_html=True)
-        run = st.button("🚀 Run", type="primary", use_container_width=True)
+        run = st.button("🚀 Run", type="primary", use_container_width=True, key="atradeaday_run")
 
     # ── Run ───────────────────────────────────────────────────────────────────
     if run:
