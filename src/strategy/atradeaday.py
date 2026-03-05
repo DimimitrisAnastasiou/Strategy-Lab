@@ -4,25 +4,31 @@ src/strategy/atradeaday.py
 A Trade A Day — standalone backtest engine.
 
 Strategy rules:
-  1. Each day, identify the FIRST candle (or the candle at entry_time if set).
-     Mark its high and low. That's the analysis.
+  1. Each day, identify the first 5-MINUTE candle (the 9:30 candle).
+     If data is 1m or 2m, resample to 5m first to get the correct candle.
+     If data is coarser than 5m (15m, 30m, 60m...), refuse with a clear error.
+     Mark its high and low. That's the entire analysis for the day.
   2. From the NEXT candle onwards, look for a Fair Value Gap that breaks
      through day_high (bullish) or day_low (bearish).
-     FVG = 3-candle pattern: c0.high < c2.low (bull) or c0.low > c2.high (bear)
+     FVG = 3-candle pattern: c0.high < c2.low (bull) or c0.low > c2.high (bear).
      The middle candle must cross the day level.
   3. Wait for price to pull back into the FVG zone.
   4. Wait for an engulfing candle that completely covers the pullback candle.
   5. Enter at the close of the engulfing candle.
   6. SL = low/high of the first FVG candle.
   7. TP = entry +/- risk x rr_ratio (default 3:1).
-  8. One trade per day maximum.
+  8. One trade per day maximum (the FIRST valid setup is taken).
+     All additional setups found that day are recorded as potential_entries
+     for extra analysis — they are NOT traded.
 
-Works with any timeframe: 1m, 5m, 15m, 30m, 60m, 1d.
+Returns ATradeADayResults which contains:
+  - backtest  : BacktestResults (identical schema to BacktestEngine output)
+  - potential_entries : List[PotentialEntry] (extra setups found but not traded)
 """
 
 import numpy as np
 import pandas as pd
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Tuple, List
 
 from src.backtest import BacktestResults, Trade
@@ -32,52 +38,136 @@ from src.backtest import BacktestResults, Trade
 # Parameters
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Intervals that are valid (≤ 5 minutes)
+_VALID_INTERVALS = {'1m', '2m', '5m'}
+
+# Intervals that need resampling to 5m before use
+_RESAMPLE_INTERVALS = {'1m', '2m'}
+
+
 @dataclass
 class ATradeADayParams:
     rr_ratio: float = 3.0
     risk_per_trade: float = 100.0
     commission_pct: float = 0.05
-    use_first_candle: bool = True   # If True, always use first candle of day
-    entry_time: str = "09:30"       # Only used if use_first_candle is False
+
+
+@dataclass
+class PotentialEntry:
+    """
+    A valid FVG setup found on a given day that was NOT traded
+    because the primary trade for that day already occurred.
+    Used for extra analysis display in the UI.
+    """
+    date: pd.Timestamp
+    direction: str          # 'long' or 'short'
+    fvg_top: float
+    fvg_bottom: float
+    sl_price: float
+    entry_price: float      # close of the engulfing candle
+    tp_price: float
+    day_high: float         # the reference 5-min candle high
+    day_low: float          # the reference 5-min candle low
+
+
+@dataclass
+class ATradeADayResults:
+    """
+    Full output of run_atradeaday().
+    backtest          → standard BacktestResults for metrics display
+    potential_entries → extra setups found on days where a trade was already taken
+    """
+    backtest: BacktestResults
+    potential_entries: List[PotentialEntry] = field(default_factory=list)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers
+# Interval validation and 5-min candle extraction
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _get_opening_bar(day_df: pd.DataFrame, params: ATradeADayParams) -> Optional[pd.Series]:
+def validate_interval(df: pd.DataFrame) -> str:
     """
-    Get the opening bar for the day.
-    If use_first_candle=True, just take the first bar.
-    Otherwise try to match entry_time — fall back to first bar if not found.
+    Read the interval from df.attrs and validate it is ≤ 5 minutes.
+
+    Returns the interval string ('1m', '2m', '5m').
+    Raises ValueError with a user-friendly message if interval is too coarse.
     """
-    if params.use_first_candle or day_df.empty:
-        return day_df.iloc[0]
+    interval = df.attrs.get('interval', None)
 
-    mask = day_df.index.strftime('%H:%M') == params.entry_time
-    if mask.any():
-        return day_df[mask].iloc[0]
+    if interval is None:
+        # Try to infer from median delta
+        if len(df) >= 2:
+            deltas  = pd.Series(df.index).diff().dropna()
+            seconds = deltas.median().total_seconds()
+            if seconds <= 60:   interval = '1m'
+            elif seconds <= 120: interval = '2m'
+            elif seconds <= 300: interval = '5m'
+            else:
+                raise ValueError(
+                    f"Could not detect interval and data appears coarser than 5 minutes. "
+                    f"A Trade A Day requires 1m, 2m, or 5m data. "
+                    f"Please reload data from the sidebar with a ≤5m interval."
+                )
+        else:
+            raise ValueError("Not enough data to detect interval.")
 
-    # Fallback: first candle of the day
-    return day_df.iloc[0]
+    if interval not in _VALID_INTERVALS:
+        raise ValueError(
+            f"Loaded data is '{interval}' — too coarse for A Trade A Day. "
+            f"This strategy requires 1m, 2m, or 5m data so the first 5-minute "
+            f"candle can be identified correctly. "
+            f"Please reload from the sidebar with interval = 1m, 2m, or 5m."
+        )
+
+    return interval
 
 
-def _find_fvg_break(
+def _get_first_5min_candle(day_df: pd.DataFrame, interval: str) -> Optional[pd.Series]:
+    """
+    Extract the first 5-minute candle of the day.
+
+    - 5m  → first bar of the day directly
+    - 1m / 2m → resample the full day to 5m, return the first 5-min bar.
+                 This correctly aggregates open/high/low/close/volume across
+                 the sub-minute bars that make up the first 5 minutes.
+
+    Returns None if the day has no usable bars after resampling.
+    """
+    if interval == '5m':
+        return day_df.iloc[0] if not day_df.empty else None
+
+    # Resample to 5-minute bars
+    agg = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'}
+    if 'volume' in day_df.columns:
+        agg['volume'] = 'sum'
+
+    resampled = day_df.resample('5min').agg(agg).dropna(subset=['open', 'close'])
+
+    if resampled.empty:
+        return None
+
+    return resampled.iloc[0]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pattern detection
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _find_all_fvg_breaks(
     bars: pd.DataFrame,
     day_high: float,
     day_low: float,
-) -> Optional[Tuple[str, int, float, float, float]]:
+) -> List[Tuple[str, int, float, float, float]]:
     """
-    Scan for a Fair Value Gap confirming a break of day_high or day_low.
+    Scan ALL 3-candle windows in `bars` for Fair Value Gaps that confirm
+    a break of day_high or day_low.
 
-    FVG conditions (relaxed to catch more setups):
-      Bullish: c0.high < c2.low  (gap between wicks)
-               AND (c1 touched day_high OR c2 closed above day_high)
-      Bearish: c0.low  > c2.high
-               AND (c1 touched day_low  OR c2 closed below day_low)
-
-    Returns (direction, c2_index, fvg_top, fvg_bottom, sl_price) or None.
+    Returns a list of (direction, c2_index, fvg_top, fvg_bottom, sl_price).
+    The list is ordered by appearance — first item is the primary setup,
+    subsequent items are potential extras.
     """
+    results = []
+
     for i in range(2, len(bars)):
         c0 = bars.iloc[i - 2]
         c1 = bars.iloc[i - 1]
@@ -86,20 +176,24 @@ def _find_fvg_break(
         # ── Bullish FVG ───────────────────────────────────────────────────────
         if c2['low'] > c0['high']:
             if c1['high'] >= day_high or c2['close'] > day_high or c1['close'] > day_high:
-                fvg_top    = c2['low']
-                fvg_bottom = c0['high']
-                sl_price   = c0['low']
-                return ('long', i, fvg_top, fvg_bottom, sl_price)
+                results.append((
+                    'long', i,
+                    c2['low'],   # fvg_top
+                    c0['high'],  # fvg_bottom
+                    c0['low'],   # sl_price
+                ))
 
         # ── Bearish FVG ───────────────────────────────────────────────────────
-        if c2['high'] < c0['low']:
+        elif c2['high'] < c0['low']:
             if c1['low'] <= day_low or c2['close'] < day_low or c1['close'] < day_low:
-                fvg_top    = c0['low']
-                fvg_bottom = c2['high']
-                sl_price   = c0['high']
-                return ('short', i, fvg_top, fvg_bottom, sl_price)
+                results.append((
+                    'short', i,
+                    c0['low'],   # fvg_top
+                    c2['high'],  # fvg_bottom
+                    c0['high'],  # sl_price
+                ))
 
-    return None
+    return results
 
 
 def _find_engulfing_entry(
@@ -109,10 +203,12 @@ def _find_engulfing_entry(
     fvg_bottom: float,
 ) -> Optional[Tuple[int, pd.Series, pd.Series]]:
     """
-    Look for pullback into FVG zone then engulfing candle entry.
+    Scan `bars` for pullback into FVG zone then an engulfing candle.
 
     Relaxed: engulf covers the body (open-close) of the pullback candle,
     not necessarily the full wicks — catches more real-world setups.
+
+    Returns (bar_position, pullback_candle, engulf_candle) or None.
     """
     in_pullback  = False
     pullback_bar = None
@@ -134,20 +230,16 @@ def _find_engulfing_entry(
             pb_body_low  = min(pullback_bar['open'], pullback_bar['close'])
 
             if direction == 'long':
-                # Full engulf OR strong close above pullback high
                 if (bar['close'] > pb_body_high and bar['open'] < pb_body_low) or \
                    (bar['close'] > pullback_bar['high'] and bar['open'] < pb_body_high):
                     return (i, pullback_bar, bar)
-                # Reset if price leaves the zone
                 if bar['low'] > fvg_top * 1.002:
                     in_pullback  = False
                     pullback_bar = None
             else:
-                # Full engulf OR strong close below pullback low
                 if (bar['close'] < pb_body_low and bar['open'] > pb_body_high) or \
                    (bar['close'] < pullback_bar['low'] and bar['open'] > pb_body_low):
                     return (i, pullback_bar, bar)
-                # Reset if price leaves the zone
                 if bar['high'] < fvg_bottom * 0.998:
                     in_pullback  = False
                     pullback_bar = None
@@ -202,7 +294,7 @@ def _simulate_exit(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Metrics
+# Metrics (mirrors BacktestEngine._calculate_metrics)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _estimate_bars_per_year(df: pd.DataFrame) -> int:
@@ -342,23 +434,33 @@ def _calculate_metrics(
 # Main entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_atradeaday(df: pd.DataFrame, params: ATradeADayParams) -> BacktestResults:
+def run_atradeaday(df: pd.DataFrame, params: ATradeADayParams) -> ATradeADayResults:
     """
-    Run the A Trade A Day strategy on any OHLCV DataFrame.
+    Run the A Trade A Day strategy.
 
-    Works with any timeframe loaded in the sidebar (1m, 5m, 15m, 60m, 1d etc).
-    One trade per calendar day maximum.
+    Requires 1m, 2m, or 5m data loaded in the sidebar.
+    Raises ValueError (caught by the UI) if the interval is too coarse.
+
+    Returns ATradeADayResults:
+      .backtest          → full BacktestResults for metrics/charts
+      .potential_entries → extra setups found on days where the primary
+                           trade was already taken (for analysis display)
     """
     if df is None or df.empty:
         empty = pd.Series(dtype=float)
-        return BacktestResults(trades=[], equity_curve=empty, realized_equity=empty)
+        empty_bt = BacktestResults(trades=[], equity_curve=empty, realized_equity=empty)
+        return ATradeADayResults(backtest=empty_bt)
+
+    # ── Validate interval ─────────────────────────────────────────────────────
+    interval = validate_interval(df)   # raises ValueError if coarse
 
     df = df.copy()
-
     bars_per_year   = _estimate_bars_per_year(df)
     initial_capital = params.risk_per_trade * 50
     capital         = float(initial_capital)
-    trades: List[Trade] = []
+
+    trades: List[Trade]          = []
+    potentials: List[PotentialEntry] = []
 
     equity_index = df.index.tolist()
     running_eq   = {ts: initial_capital for ts in equity_index}
@@ -369,107 +471,133 @@ def run_atradeaday(df: pd.DataFrame, params: ATradeADayParams) -> BacktestResult
         if len(day_df) < 4:
             continue
 
-        opening_bar = _get_opening_bar(day_df, params)
+        # ── Step 1: Get the first 5-min candle of the day ─────────────────────
+        opening_bar = _get_first_5min_candle(day_df, interval)
         if opening_bar is None:
             continue
 
-        day_high = opening_bar['high']
-        day_low  = opening_bar['low']
+        day_high = float(opening_bar['high'])
+        day_low  = float(opening_bar['low'])
 
-        post_open = day_df[day_df.index > opening_bar.name]
+        # All bars AFTER the opening candle, same day
+        post_open = day_df[day_df.index > opening_bar.name] \
+                    if hasattr(opening_bar, 'name') and opening_bar.name in day_df.index \
+                    else day_df.iloc[1:]
+
         if len(post_open) < 3:
             continue
 
-        fvg_result = _find_fvg_break(post_open, day_high, day_low)
-        if fvg_result is None:
+        # ── Step 2: Find ALL FVG breaks on this day ───────────────────────────
+        all_fvgs = _find_all_fvg_breaks(post_open, day_high, day_low)
+        if not all_fvgs:
             continue
 
-        direction, fvg_c2_pos, fvg_top, fvg_bottom, sl_price_raw = fvg_result
+        trade_taken = False
 
-        post_fvg = post_open.iloc[fvg_c2_pos + 1:]
-        if len(post_fvg) < 1:
-            continue
+        for fvg_idx, fvg_result in enumerate(all_fvgs):
+            direction, fvg_c2_pos, fvg_top, fvg_bottom, sl_price_raw = fvg_result
 
-        entry_result = _find_engulfing_entry(post_fvg, direction, fvg_top, fvg_bottom)
-        if entry_result is None:
-            continue
+            post_fvg = post_open.iloc[fvg_c2_pos + 1:]
+            if len(post_fvg) < 1:
+                continue
 
-        _, _, engulf_bar = entry_result
-        entry_price = float(engulf_bar['close'])
-        sl_price    = float(sl_price_raw)
+            entry_result = _find_engulfing_entry(post_fvg, direction, fvg_top, fvg_bottom)
+            if entry_result is None:
+                continue
 
-        if direction == 'long':
-            risk_per_unit = entry_price - sl_price
-            tp_price      = entry_price + risk_per_unit * params.rr_ratio
-        else:
-            risk_per_unit = sl_price - entry_price
-            tp_price      = entry_price - risk_per_unit * params.rr_ratio
+            _, _, engulf_bar = entry_result
+            entry_price = float(engulf_bar['close'])
+            sl_price    = float(sl_price_raw)
 
-        # Skip if SL is nonsensical
-        if risk_per_unit <= 0 or risk_per_unit > entry_price * 0.15:
-            continue
+            if direction == 'long':
+                risk_per_unit = entry_price - sl_price
+                tp_price      = entry_price + risk_per_unit * params.rr_ratio
+            else:
+                risk_per_unit = sl_price - entry_price
+                tp_price      = entry_price - risk_per_unit * params.rr_ratio
 
-        position_size_dollars = params.risk_per_trade / (risk_per_unit / entry_price)
+            if risk_per_unit <= 0 or risk_per_unit > entry_price * 0.15:
+                continue
 
-        remaining = post_fvg[post_fvg.index > engulf_bar.name]
+            # ── First valid setup of the day → TRADE IT ───────────────────────
+            if not trade_taken:
+                trade_taken = True
 
-        if len(remaining) == 0:
-            exit_price  = entry_price
-            exit_reason = 'end_of_data'
-            bars_held   = 0
-            exit_ts     = engulf_bar.name
-        else:
-            exit_price, exit_reason, bars_held = _simulate_exit(
-                remaining, direction, sl_price, tp_price
-            )
-            exit_idx = min(bars_held - 1, len(remaining) - 1)
-            exit_ts  = remaining.index[exit_idx]
+                position_size_dollars = params.risk_per_trade / (risk_per_unit / entry_price)
+                remaining = post_fvg[post_fvg.index > engulf_bar.name]
 
-        if direction == 'long':
-            pnl_pct = (exit_price - entry_price) / entry_price * 100
-        else:
-            pnl_pct = (entry_price - exit_price) / entry_price * 100
+                if len(remaining) == 0:
+                    exit_price  = entry_price
+                    exit_reason = 'end_of_data'
+                    bars_held   = 0
+                    exit_ts     = engulf_bar.name
+                else:
+                    exit_price, exit_reason, bars_held = _simulate_exit(
+                        remaining, direction, sl_price, tp_price
+                    )
+                    exit_idx = min(bars_held - 1, len(remaining) - 1)
+                    exit_ts  = remaining.index[exit_idx]
 
-        pnl_pct -= params.commission_pct * 2
-        pnl      = position_size_dollars * (pnl_pct / 100)
-        capital += pnl
+                if direction == 'long':
+                    pnl_pct = (exit_price - entry_price) / entry_price * 100
+                else:
+                    pnl_pct = (entry_price - exit_price) / entry_price * 100
 
-        try:
-            entry_iloc = equity_index.index(engulf_bar.name)
-            exit_iloc  = equity_index.index(exit_ts)
-        except ValueError:
-            entry_iloc = exit_iloc = 0
+                pnl_pct -= params.commission_pct * 2
+                pnl      = position_size_dollars * (pnl_pct / 100)
+                capital += pnl
 
-        trade = Trade(
-            entry_idx    = entry_iloc,
-            entry_date   = engulf_bar.name,
-            entry_price  = entry_price,
-            direction    = direction,
-            size_dollars = position_size_dollars,
-            exit_idx     = exit_iloc,
-            exit_date    = exit_ts,
-            exit_price   = exit_price,
-            exit_reason  = exit_reason,
-            pnl          = pnl,
-            pnl_pct      = pnl_pct,
-            bars_held    = bars_held,
-            mae          = 0.0,
-            mfe          = 0.0,
-        )
-        trades.append(trade)
+                try:
+                    entry_iloc = equity_index.index(engulf_bar.name)
+                    exit_iloc  = equity_index.index(exit_ts)
+                except ValueError:
+                    entry_iloc = exit_iloc = 0
 
-        # Update equity from exit bar onwards
-        updating = False
-        for ts in equity_index:
-            if ts == exit_ts:
-                updating = True
-            if updating:
-                running_eq[ts] = capital
+                trades.append(Trade(
+                    entry_idx    = entry_iloc,
+                    entry_date   = engulf_bar.name,
+                    entry_price  = entry_price,
+                    direction    = direction,
+                    size_dollars = position_size_dollars,
+                    exit_idx     = exit_iloc,
+                    exit_date    = exit_ts,
+                    exit_price   = exit_price,
+                    exit_reason  = exit_reason,
+                    pnl          = pnl,
+                    pnl_pct      = pnl_pct,
+                    bars_held    = bars_held,
+                    mae          = 0.0,
+                    mfe          = 0.0,
+                ))
+
+                # Update equity from exit bar onwards
+                updating = False
+                for ts in equity_index:
+                    if ts == exit_ts:
+                        updating = True
+                    if updating:
+                        running_eq[ts] = capital
+
+            else:
+                # ── Subsequent setups on same day → POTENTIAL only ─────────────
+                potentials.append(PotentialEntry(
+                    date        = engulf_bar.name,
+                    direction   = direction,
+                    fvg_top     = fvg_top,
+                    fvg_bottom  = fvg_bottom,
+                    sl_price    = sl_price,
+                    entry_price = entry_price,
+                    tp_price    = tp_price,
+                    day_high    = day_high,
+                    day_low     = day_low,
+                ))
 
     equity_curve    = pd.Series(running_eq, index=equity_index)
     realized_equity = equity_curve.copy()
 
-    return _calculate_metrics(
+    backtest = _calculate_metrics(
         trades, equity_curve, realized_equity,
         initial_capital, params.commission_pct, bars_per_year,
     )
+
+    return ATradeADayResults(backtest=backtest, potential_entries=potentials)
